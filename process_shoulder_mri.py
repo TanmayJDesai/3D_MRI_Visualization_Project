@@ -76,8 +76,55 @@ def process_mri_slices(image_paths, output_folder):
             'muscle': muscle_mask_final
         }
         
-        # Create and save visualizations (code for visualization plots remains the same)
-        # ...
+        # Create visualization of segmentation - ADDING THIS PART BACK
+        # Combined visualization - Blue for bone, Green for soft tissue, Red for muscle
+        combined = np.zeros((img.shape[0], img.shape[1], 3), dtype=np.uint8)
+        combined[bone_mask_final, 2] = 255  # Blue for bone
+        combined[soft_tissue_mask_final, 1] = 255  # Green for soft tissue
+        combined[muscle_mask_final, 0] = 255  # Red for muscle
+        
+        # Save combined visualization
+        combined_output = os.path.join(output_folder, 'segmented', f"{plane}_segmentation.png")
+        io.imsave(combined_output, combined)
+        
+        # Show original and segmentation results
+        plt.figure(figsize=(20, 5))
+        plt.subplot(151)
+        plt.imshow(img, cmap='gray')
+        plt.title(f'Original {plane}')
+        
+        plt.subplot(152)
+        plt.imshow(img_eq, cmap='gray')
+        plt.title('Enhanced Image')
+        
+        plt.subplot(153)
+        plt.imshow(bone_mask_final, cmap='Blues')
+        plt.title('Bone (Grey Regions)')
+        
+        plt.subplot(154)
+        plt.imshow(soft_tissue_mask_final, cmap='Greens')
+        plt.title('Soft Tissue (Darker White)')
+        
+        plt.subplot(155)
+        plt.imshow(muscle_mask_final, cmap='Reds')
+        plt.title('Muscle (White Regions)')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_folder, 'segmented', f"{plane}_result.png"))
+        
+        # Additional visualization showing combined segmentation
+        plt.figure(figsize=(10, 5))
+        plt.subplot(121)
+        plt.imshow(img, cmap='gray')
+        plt.title(f'Original {plane}')
+        
+        plt.subplot(122)
+        plt.imshow(combined)
+        plt.title('Combined Segmentation\nBlue: Bone, Green: Soft Tissue, Red: Muscle')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_folder, 'segmented', f"{plane}_combined.png"))
+        plt.close('all')
     
     # Create anatomically correct 3D shoulder model
     create_anatomical_shoulder_model(segmentations, output_folder)
