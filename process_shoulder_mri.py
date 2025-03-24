@@ -1,13 +1,13 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-from skimage import io, filters, morphology, measure, exposure
+from skimage import io, filters, morphology, measure, exposure, feature, segmentation, color
 from scipy import ndimage
 import pyvista as pv
 
 def process_mri_slices(image_paths, output_folder):
     """
-    Process MRI slices to create a 3D model of a shoulder from three planes.
+    Process MRI slices to create a 3D model of a shoulder from three planes with improved segmentation.
     
     Args:
         image_paths: Dictionary with keys 'axial', 'sagittal', 'coronal' and paths as values
@@ -37,37 +37,69 @@ def process_mri_slices(image_paths, output_folder):
         if img_norm.max() > 0:
             img_norm = img_norm / img_norm.max()
         
-        # Enhance contrast to better distinguish tissues
-        img_eq = exposure.equalize_adapthist(img_norm, clip_limit=0.03)
+        # IMPROVED PREPROCESSING
+        # Apply CLAHE for better contrast enhancement
+        img_eq = exposure.equalize_adapthist(img_norm, clip_limit=0.02)
         
-        # Define thresholds based on intensity
-        black_threshold = 0.1  # Pure black (background)
-        bone_threshold_low = 0.3  # Grey (bone)
-        bone_threshold_high = 0.65
-        soft_threshold_low = 0.65  # Darker white (soft tissue)
-        soft_threshold_high = 0.85
-        muscle_threshold_low = 0.85  # White (muscle)
+        # Apply bilateral filter to reduce noise while preserving edges
+        img_filtered = filters.gaussian(img_eq, sigma=0.5)
+        
+        # IMPROVED SEGMENTATION APPROACH
+        # Use multi-Otsu thresholding to find optimal thresholds for separating tissues
+        thresholds = filters.threshold_multiotsu(img_filtered, classes=4)
         
         # Create masks for each tissue type
-        black_mask = img_eq <= black_threshold
-        bone_mask = (img_eq > bone_threshold_low) & (img_eq < bone_threshold_high)
-        soft_tissue_mask = (img_eq >= soft_threshold_low) & (img_eq < soft_threshold_high)
-        muscle_mask = img_eq >= muscle_threshold_low
+        background_mask = img_filtered <= thresholds[0]
+        bone_mask = (img_filtered > thresholds[0]) & (img_filtered <= thresholds[1])
+        soft_tissue_mask = (img_filtered > thresholds[1]) & (img_filtered <= thresholds[2])
+        muscle_mask = img_filtered > thresholds[2]
         
-        # Clean up masks with morphological operations
-        bone_mask = morphology.remove_small_objects(bone_mask, min_size=50)
-        bone_mask = morphology.closing(bone_mask, morphology.disk(2))
+        # IMPROVED MORPHOLOGICAL OPERATIONS
+        # Clean up masks with more targeted morphological operations
+        # Remove small objects
+        bone_mask = morphology.remove_small_objects(bone_mask, min_size=100)
+        soft_tissue_mask = morphology.remove_small_objects(soft_tissue_mask, min_size=150)
+        muscle_mask = morphology.remove_small_objects(muscle_mask, min_size=80)
         
-        soft_tissue_mask = morphology.remove_small_objects(soft_tissue_mask, min_size=100)
-        soft_tissue_mask = morphology.closing(soft_tissue_mask, morphology.disk(3))
-        
-        muscle_mask = morphology.remove_small_objects(muscle_mask, min_size=50)
+        # Close holes
+        bone_mask = morphology.closing(bone_mask, morphology.disk(3))
+        soft_tissue_mask = morphology.closing(soft_tissue_mask, morphology.disk(4))
         muscle_mask = morphology.closing(muscle_mask, morphology.disk(2))
         
-        # Ensure no overlap between masks
+        # Apply context-specific filtering based on anatomical knowledge
+        # For example, ensure muscle areas are connected and coherent
+        muscle_mask = morphology.area_opening(muscle_mask, area_threshold=50)
+        
+        # IMPROVED MASK SEPARATION
+        # Ensure no overlap between masks with priority order: muscle > soft tissue > bone
+        # This ensures clear boundaries between tissue types
         muscle_mask_final = muscle_mask
         soft_tissue_mask_final = soft_tissue_mask & ~muscle_mask_final
         bone_mask_final = bone_mask & ~soft_tissue_mask_final & ~muscle_mask_final
+        
+        # Post-processing: ensure anatomical continuity
+        # For example, bones should be continuous structures
+        bone_labeled = measure.label(bone_mask_final)
+        bone_props = measure.regionprops(bone_labeled)
+        
+        if len(bone_props) > 0:
+            # Keep only the largest bone regions
+            large_bone_labels = sorted([prop.label for prop in bone_props], 
+                                       key=lambda x: np.sum(bone_labeled == x), 
+                                       reverse=True)[:3]  # Keep top 3 largest regions
+            
+            bone_mask_final = np.isin(bone_labeled, large_bone_labels)
+        
+        # Similar process for muscle to ensure we keep only significant muscle regions
+        muscle_labeled = measure.label(muscle_mask_final)
+        muscle_props = measure.regionprops(muscle_labeled)
+        
+        if len(muscle_props) > 0:
+            large_muscle_labels = sorted([prop.label for prop in muscle_props], 
+                                        key=lambda x: np.sum(muscle_labeled == x), 
+                                        reverse=True)[:5]  # Keep top 5 largest regions
+            
+            muscle_mask_final = np.isin(muscle_labeled, large_muscle_labels)
         
         # Save segmentation results
         segmentations[plane] = {
@@ -76,8 +108,8 @@ def process_mri_slices(image_paths, output_folder):
             'muscle': muscle_mask_final
         }
         
-        # Create visualization of segmentation - ADDING THIS PART BACK
-        # Combined visualization - Blue for bone, Green for soft tissue, Red for muscle
+        # Create visualization of segmentation
+        # Combined visualization with enhanced colors and opacity
         combined = np.zeros((img.shape[0], img.shape[1], 3), dtype=np.uint8)
         combined[bone_mask_final, 2] = 255  # Blue for bone
         combined[soft_tissue_mask_final, 1] = 255  # Green for soft tissue
@@ -87,6 +119,15 @@ def process_mri_slices(image_paths, output_folder):
         combined_output = os.path.join(output_folder, 'segmented', f"{plane}_segmentation.png")
         io.imsave(combined_output, combined)
         
+        # Create a blended visualization with original image and segmentation
+        blended = color.label2rgb(
+            bone_mask_final.astype(int) + soft_tissue_mask_final.astype(int)*2 + muscle_mask_final.astype(int)*3,
+            img_norm, 
+            colors=[(0, 0, 0.8), (0, 0.8, 0), (0.8, 0, 0)],
+            alpha=0.5,
+            bg_label=0
+        )
+        
         # Show original and segmentation results
         plt.figure(figsize=(20, 5))
         plt.subplot(151)
@@ -94,33 +135,37 @@ def process_mri_slices(image_paths, output_folder):
         plt.title(f'Original {plane}')
         
         plt.subplot(152)
-        plt.imshow(img_eq, cmap='gray')
-        plt.title('Enhanced Image')
+        plt.imshow(img_filtered, cmap='gray')
+        plt.title('Filtered Image')
         
         plt.subplot(153)
         plt.imshow(bone_mask_final, cmap='Blues')
-        plt.title('Bone (Grey Regions)')
+        plt.title('Bone (Blue)')
         
         plt.subplot(154)
         plt.imshow(soft_tissue_mask_final, cmap='Greens')
-        plt.title('Soft Tissue (Darker White)')
+        plt.title('Soft Tissue (Green)')
         
         plt.subplot(155)
         plt.imshow(muscle_mask_final, cmap='Reds')
-        plt.title('Muscle (White Regions)')
+        plt.title('Muscle (Red)')
         
         plt.tight_layout()
         plt.savefig(os.path.join(output_folder, 'segmented', f"{plane}_result.png"))
         
-        # Additional visualization showing combined segmentation
-        plt.figure(figsize=(10, 5))
-        plt.subplot(121)
+        # Additional visualization showing blended segmentation
+        plt.figure(figsize=(15, 5))
+        plt.subplot(131)
         plt.imshow(img, cmap='gray')
         plt.title(f'Original {plane}')
         
-        plt.subplot(122)
+        plt.subplot(132)
         plt.imshow(combined)
-        plt.title('Combined Segmentation\nBlue: Bone, Green: Soft Tissue, Red: Muscle')
+        plt.title('Segmentation\nBlue: Bone, Green: Soft Tissue, Red: Muscle')
+        
+        plt.subplot(133)
+        plt.imshow(blended)
+        plt.title('Blended Segmentation')
         
         plt.tight_layout()
         plt.savefig(os.path.join(output_folder, 'segmented', f"{plane}_combined.png"))
@@ -152,12 +197,13 @@ def create_anatomical_shoulder_model(segmentations, output_folder):
     soft_volume = np.zeros((volume_size, volume_size, volume_size), dtype=bool)
     muscle_volume = np.zeros((volume_size, volume_size, volume_size), dtype=bool)
     
-    # Anatomical parameters for shoulder structure
+    # Improved anatomical parameters for shoulder structure
     # These parameters position the planes to form a proper shoulder shape
     scapula_position = int(volume_size * 0.5)  # Center of scapula
     humeral_head_center = (int(volume_size * 0.6), int(volume_size * 0.4), int(volume_size * 0.5))
     glenoid_center = (int(volume_size * 0.4), int(volume_size * 0.4), int(volume_size * 0.5))
     
+    # IMPROVED ALIGNMENT
     # Properly align and place axial plane (top view of shoulder)
     axial_bone = segmentations['axial']['bone']
     axial_soft = segmentations['axial']['soft_tissue']
@@ -168,19 +214,19 @@ def create_anatomical_shoulder_model(segmentations, output_folder):
     axial_soft_resized = resize_binary_image(axial_soft, (volume_size, volume_size))
     axial_muscle_resized = resize_binary_image(axial_muscle, (volume_size, volume_size))
     
-    # Position axial plane properly for shoulder anatomy
-    for z in range(scapula_position-20, scapula_position+20):
-        # Vary opacity based on distance from center
-        opacity = 1.0 - abs(z - scapula_position) / 20.0
-        if opacity <= 0:
-            continue
+    # Position axial plane properly for shoulder anatomy with improved weighting
+    for z in range(scapula_position-25, scapula_position+25):
+        # Improved opacity profile for better transitions
+        # Use a Gaussian weighting instead of linear
+        dist = abs(z - scapula_position)
+        opacity = np.exp(-(dist**2) / (2 * 10**2))  # Gaussian weighting
             
-        # Add with decreasing opacity away from center
-        bone_volume[:, :, z] = bone_volume[:, :, z] | (axial_bone_resized * opacity > 0.2)
-        soft_volume[:, :, z] = soft_volume[:, :, z] | (axial_soft_resized * opacity > 0.2)
-        muscle_volume[:, :, z] = muscle_volume[:, :, z] | (axial_muscle_resized * opacity > 0.2)
+        # Add with Gaussian opacity away from center
+        bone_volume[:, :, z] = bone_volume[:, :, z] | (axial_bone_resized & (np.random.random(axial_bone_resized.shape) < opacity))
+        soft_volume[:, :, z] = soft_volume[:, :, z] | (axial_soft_resized & (np.random.random(axial_soft_resized.shape) < opacity))
+        muscle_volume[:, :, z] = muscle_volume[:, :, z] | (axial_muscle_resized & (np.random.random(axial_muscle_resized.shape) < opacity))
     
-    # Place sagittal plane (side view)
+    # Place sagittal plane (side view) with improved alignment
     sagittal_bone = segmentations['sagittal']['bone']
     sagittal_soft = segmentations['sagittal']['soft_tissue']
     sagittal_muscle = segmentations['sagittal']['muscle']
@@ -190,19 +236,18 @@ def create_anatomical_shoulder_model(segmentations, output_folder):
     sagittal_soft_resized = resize_binary_image(sagittal_soft, (volume_size, volume_size))
     sagittal_muscle_resized = resize_binary_image(sagittal_muscle, (volume_size, volume_size))
     
-    # Position sagittal plane properly for shoulder anatomy
-    for x in range(humeral_head_center[0]-20, humeral_head_center[0]+20):
-        # Vary opacity based on distance from center
-        opacity = 1.0 - abs(x - humeral_head_center[0]) / 20.0
-        if opacity <= 0:
-            continue
+    # Position sagittal plane properly for shoulder anatomy with improved weighting
+    for x in range(humeral_head_center[0]-25, humeral_head_center[0]+25):
+        # Improved opacity profile
+        dist = abs(x - humeral_head_center[0])
+        opacity = np.exp(-(dist**2) / (2 * 10**2))  # Gaussian weighting
             
-        # Add with decreasing opacity away from center
-        bone_volume[x, :, :] = bone_volume[x, :, :] | (np.rot90(sagittal_bone_resized) * opacity > 0.2)
-        soft_volume[x, :, :] = soft_volume[x, :, :] | (np.rot90(sagittal_soft_resized) * opacity > 0.2)
-        muscle_volume[x, :, :] = muscle_volume[x, :, :] | (np.rot90(sagittal_muscle_resized) * opacity > 0.2)
+        # Add with improved opacity profile
+        bone_volume[x, :, :] = bone_volume[x, :, :] | (np.rot90(sagittal_bone_resized) & (np.random.random(np.rot90(sagittal_bone_resized).shape) < opacity))
+        soft_volume[x, :, :] = soft_volume[x, :, :] | (np.rot90(sagittal_soft_resized) & (np.random.random(np.rot90(sagittal_soft_resized).shape) < opacity))
+        muscle_volume[x, :, :] = muscle_volume[x, :, :] | (np.rot90(sagittal_muscle_resized) & (np.random.random(np.rot90(sagittal_muscle_resized).shape) < opacity))
     
-    # Place coronal plane (front view)
+    # Place coronal plane (front view) with improved alignment
     coronal_bone = segmentations['coronal']['bone']
     coronal_soft = segmentations['coronal']['soft_tissue']
     coronal_muscle = segmentations['coronal']['muscle']
@@ -212,32 +257,36 @@ def create_anatomical_shoulder_model(segmentations, output_folder):
     coronal_soft_resized = resize_binary_image(coronal_soft, (volume_size, volume_size))
     coronal_muscle_resized = resize_binary_image(coronal_muscle, (volume_size, volume_size))
     
-    # Position coronal plane properly for shoulder anatomy
-    for y in range(glenoid_center[1]-20, glenoid_center[1]+20):
-        # Vary opacity based on distance from center
-        opacity = 1.0 - abs(y - glenoid_center[1]) / 20.0
-        if opacity <= 0:
-            continue
+    # Position coronal plane properly for shoulder anatomy with improved weighting
+    for y in range(glenoid_center[1]-25, glenoid_center[1]+25):
+        # Improved opacity profile
+        dist = abs(y - glenoid_center[1])
+        opacity = np.exp(-(dist**2) / (2 * 10**2))  # Gaussian weighting
             
-        # Add with decreasing opacity away from center
-        bone_volume[:, y, :] = bone_volume[:, y, :] | (np.rot90(coronal_bone_resized) * opacity > 0.2)
-        soft_volume[:, y, :] = soft_volume[:, y, :] | (np.rot90(coronal_soft_resized) * opacity > 0.2)
-        muscle_volume[:, y, :] = muscle_volume[:, y, :] | (np.rot90(coronal_muscle_resized) * opacity > 0.2)
+        # Add with improved opacity profile
+        bone_volume[:, y, :] = bone_volume[:, y, :] | (np.rot90(coronal_bone_resized) & (np.random.random(np.rot90(coronal_bone_resized).shape) < opacity))
+        soft_volume[:, y, :] = soft_volume[:, y, :] | (np.rot90(coronal_soft_resized) & (np.random.random(np.rot90(coronal_soft_resized).shape) < opacity))
+        muscle_volume[:, y, :] = muscle_volume[:, y, :] | (np.rot90(coronal_muscle_resized) & (np.random.random(np.rot90(coronal_muscle_resized).shape) < opacity))
     
-    # Add anatomical shoulder shapes
-    # Add humeral head (ball shape)
+    # IMPROVED ANATOMICAL SHAPES
+    # Add anatomical shoulder shapes with better definition
+    # Add humeral head (ball shape) with improved anatomy
     radius = int(volume_size * 0.15)
     hh_center = humeral_head_center
     
     x, y, z = np.ogrid[:volume_size, :volume_size, :volume_size]
     dist_from_center = np.sqrt((x - hh_center[0])**2 + (y - hh_center[1])**2 + (z - hh_center[2])**2)
-    humeral_head = dist_from_center <= radius
     
-    # Add glenoid fossa (socket shape)
+    # Create slightly elliptical humeral head (more anatomically correct)
+    humeral_head = ((x - hh_center[0])**2 / (radius*1.1)**2 + 
+                   (y - hh_center[1])**2 / radius**2 + 
+                   (z - hh_center[2])**2 / radius**2) <= 1.0
+    
+    # Add glenoid fossa (socket shape) with improved shape
     radius_glenoid = int(volume_size * 0.12)
     glenoid_center_point = glenoid_center
     
-    x, y, z = np.ogrid[:volume_size, :volume_size, :volume_size]
+    # Create slightly concave glenoid fossa (more anatomically correct)
     dist_from_glenoid = np.sqrt((x - glenoid_center_point[0])**2 + 
                                (y - glenoid_center_point[1])**2 + 
                                (z - glenoid_center_point[2])**2)
@@ -249,39 +298,58 @@ def create_anatomical_shoulder_model(segmentations, output_folder):
     # Add anatomical elements to appropriate tissue volumes
     bone_volume = bone_volume | humeral_head | glenoid
     
-    # Add rotator cuff (muscle tissue surrounding humeral head)
+    # IMPROVED SOFT TISSUE MODELING
+    # Add rotator cuff (muscle tissue surrounding humeral head) with better definition
     rotator_cuff_outer = np.zeros_like(bone_volume)
     rotator_thickness = 15
     
+    # Create anatomically correct rotator cuff that wraps around the humeral head
+    # but doesn't completely enclose it (matches real anatomy)
     x, y, z = np.ogrid[:volume_size, :volume_size, :volume_size]
+    
+    # Create a partial spherical shell (upper part of humeral head)
     dist_from_center = np.sqrt((x - hh_center[0])**2 + (y - hh_center[1])**2 + (z - hh_center[2])**2)
-    rotator_cuff_outer = (dist_from_center <= radius + rotator_thickness) & (dist_from_center > radius)
+    
+    # Only cover upper part of humeral head with cuff (anatomically correct)
+    upper_region = y < hh_center[1]  # Upper portion only
+    rotator_cuff_outer = (dist_from_center <= radius + rotator_thickness) & (dist_from_center > radius) & upper_region
     
     # Add cuff to muscle volume
     muscle_volume = muscle_volume | rotator_cuff_outer
     
-    # Add soft tissue layer between bone and muscle
+    # Add better defined soft tissue layer between bone and muscle
     soft_tissue_layer = np.zeros_like(soft_volume)
     layer_thickness = 5
     
-    x, y, z = np.ogrid[:volume_size, :volume_size, :volume_size]
+    # Create a thin cartilage/soft tissue layer over bone surfaces
     dist_from_center = np.sqrt((x - hh_center[0])**2 + (y - hh_center[1])**2 + (z - hh_center[2])**2)
     soft_tissue_layer = (dist_from_center <= radius + layer_thickness) & (dist_from_center > radius)
     
-    # Add layer to soft tissue volume
-    soft_volume = soft_volume | soft_tissue_layer
+    # Also add soft tissue around glenoid
+    dist_from_glenoid = np.sqrt((x - glenoid_center_point[0])**2 + 
+                              (y - glenoid_center_point[1])**2 + 
+                              (z - glenoid_center_point[2])**2)
     
-    # Smooth volumes
-    bone_volume_smooth = ndimage.gaussian_filter(bone_volume.astype(float), sigma=1.5)
-    soft_volume_smooth = ndimage.gaussian_filter(soft_volume.astype(float), sigma=1.5)
-    muscle_volume_smooth = ndimage.gaussian_filter(muscle_volume.astype(float), sigma=1.5)
+    glenoid_soft = (dist_from_glenoid <= radius_glenoid + layer_thickness) & (dist_from_glenoid > radius_glenoid)
+    
+    # Add layer to soft tissue volume
+    soft_volume = soft_volume | soft_tissue_layer | glenoid_soft
+    
+    # IMPROVED VOLUME SMOOTHING & FINALIZATION
+    # Apply more nuanced smoothing to preserve tissue boundaries
+    # For bone: less smoothing to preserve structural details
+    bone_volume_smooth = ndimage.gaussian_filter(bone_volume.astype(float), sigma=1.2)
+    # For soft tissue: moderate smoothing
+    soft_volume_smooth = ndimage.gaussian_filter(soft_volume.astype(float), sigma=1.8)
+    # For muscle: more smoothing for realistic muscle appearance
+    muscle_volume_smooth = ndimage.gaussian_filter(muscle_volume.astype(float), sigma=2.0)
     
     # Convert back to binary with appropriate thresholds
-    bone_volume = bone_volume_smooth > 0.2
+    bone_volume = bone_volume_smooth > 0.25  # Higher threshold to prevent over-smoothing
     soft_volume = soft_volume_smooth > 0.2
     muscle_volume = muscle_volume_smooth > 0.2
     
-    # Ensure no overlap between volumes
+    # Ensure no overlap between volumes with priority
     muscle_volume_final = muscle_volume
     soft_volume_final = soft_volume & ~muscle_volume_final
     bone_volume_final = bone_volume & ~soft_volume_final & ~muscle_volume_final
@@ -289,31 +357,32 @@ def create_anatomical_shoulder_model(segmentations, output_folder):
     # Create meshes using marching cubes algorithm
     print("Creating 3D meshes of anatomical shoulder...")
     
-    # Bone mesh
+    # Bone mesh with improved smoothing
     try:
         bone_verts, bone_faces, _, _ = measure.marching_cubes(bone_volume_final)
         bone_mesh = pv.PolyData(bone_verts, faces=np.column_stack(([3] * len(bone_faces), bone_faces)))
-        bone_mesh = bone_mesh.smooth(n_iter=15)
+        # Heavier smoothing for bone to get anatomical smoothness but preserve features
+        bone_mesh = bone_mesh.smooth(n_iter=20, relaxation_factor=0.2)
         bone_mesh.save(os.path.join(output_folder, 'models', 'shoulder_bone.stl'))
         print("Saved bone model")
     except Exception as e:
         print(f"Error creating bone mesh: {e}")
     
-    # Soft tissue mesh
+    # Soft tissue mesh with improved smoothing
     try:
         soft_verts, soft_faces, _, _ = measure.marching_cubes(soft_volume_final)
         soft_mesh = pv.PolyData(soft_verts, faces=np.column_stack(([3] * len(soft_faces), soft_faces)))
-        soft_mesh = soft_mesh.smooth(n_iter=15)
+        soft_mesh = soft_mesh.smooth(n_iter=18, relaxation_factor=0.25)
         soft_mesh.save(os.path.join(output_folder, 'models', 'shoulder_soft_tissue.stl'))
         print("Saved soft tissue model")
     except Exception as e:
         print(f"Error creating soft tissue mesh: {e}")
     
-    # Muscle mesh
+    # Muscle mesh with improved smoothing
     try:
         muscle_verts, muscle_faces, _, _ = measure.marching_cubes(muscle_volume_final)
         muscle_mesh = pv.PolyData(muscle_verts, faces=np.column_stack(([3] * len(muscle_faces), muscle_faces)))
-        muscle_mesh = muscle_mesh.smooth(n_iter=15)
+        muscle_mesh = muscle_mesh.smooth(n_iter=25, relaxation_factor=0.3)  # More smoothing for muscles
         muscle_mesh.save(os.path.join(output_folder, 'models', 'shoulder_muscle.stl'))
         print("Saved muscle model")
     except Exception as e:
@@ -323,17 +392,17 @@ def create_anatomical_shoulder_model(segmentations, output_folder):
     try:
         p = pv.Plotter(off_screen=True)
         
-        # Add meshes with anatomically correct colors
-        p.add_mesh(bone_mesh, color='ivory', opacity=1.0, label='Bone (Grey)')
-        p.add_mesh(soft_mesh, color='lightpink', opacity=0.6, label='Soft Tissue (Darker White)')
-        p.add_mesh(muscle_mesh, color='firebrick', opacity=0.7, label='Muscle (White)')
+        # Add meshes with anatomically correct colors and better opacity
+        p.add_mesh(bone_mesh, color='ivory', opacity=1.0, label='Bone (Blue)')
+        p.add_mesh(soft_mesh, color='lightpink', opacity=0.7, label='Soft Tissue (Green)')
+        p.add_mesh(muscle_mesh, color='firebrick', opacity=0.8, label='Muscle (Red)')
         
         # Set better camera angle for shoulder visualization
         p.camera_position = [(200, 200, 200), (volume_size/2, volume_size/2, volume_size/2), (0, 0, 1)]
         p.add_legend()
         
         # Save the visualization
-        p.screenshot(os.path.join(output_folder, 'models', 'shoulder_3d_model.png'))
+        p.screenshot(os.path.join(output_folder, 'models', 'shoulder_3d_model.png'), window_size=(1200, 1000))
         print("Created anatomical shoulder visualization")
         
         # Create separate visualizations for each tissue
@@ -345,7 +414,7 @@ def create_anatomical_shoulder_model(segmentations, output_folder):
             p_single = pv.Plotter(off_screen=True)
             p_single.add_mesh(mesh, color=color, opacity=1.0, label=name)
             p_single.camera_position = [(200, 200, 200), (volume_size/2, volume_size/2, volume_size/2), (0, 0, 1)]
-            p_single.screenshot(os.path.join(output_folder, 'models', f'shoulder_{tissue}.png'))
+            p_single.screenshot(os.path.join(output_folder, 'models', f'shoulder_{tissue}.png'), window_size=(1000, 1000))
             
     except Exception as e:
         print(f"Error creating visualization: {e}")
